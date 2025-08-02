@@ -101,3 +101,6 @@ echo "ERROR: Window for '$APP' was NOT found or dispatched properly to workspace
 # Log error if window was not found or dispatched correctly.
 # Запис помилки, якщо вікно не знайдено або неправильно диспатчено.
 exit 1
+
+
+#This script is also incluided into the https://github.com/JaKooLit/Hyprland-Dots project.
