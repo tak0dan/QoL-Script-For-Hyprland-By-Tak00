@@ -1,4 +1,17 @@
 #!/bin/bash
+##################################################################
+#                                                                #   
+#                                                                #
+#                  TAK_0'S Per-Window-Switch                     #
+#                                                                #
+#                                                                #
+#                                                                #
+#  This script is being made considering the fact that sometimes #
+#       Hyprland messes up the startup dispatch process and      #
+#      dispatches windows on startup in a very weird way.        #  
+#                                                                #
+##################################################################
+
 # USAGE / ІНСТРУКЦІЯ:
 # 1) Run from terminal:
 #    ./dispatch.sh <application_command> <target_workspace_number>
