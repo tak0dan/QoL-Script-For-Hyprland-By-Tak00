@@ -22,6 +22,7 @@ What the daemon does
 Only Python 3 and hyprctl are needed.
 """
 import argparse
+import fcntl
 import json
 import os
 import select
@@ -381,6 +382,14 @@ class Daemon:
 
 
 def run_daemon():
+    # One daemon per session, so it can be started from a keybind or exec-once
+    # as well as from systemd without ever running twice.
+    lock_path = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "tak0-layout.lock"
+    lock = open(lock_path, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
     stats = Stats()
     stop = []
 
