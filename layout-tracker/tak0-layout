@@ -35,7 +35,11 @@ from pathlib import Path
 HALF_LIFE_DAYS = float(os.environ.get("TAK0_LAYOUT_HALF_LIFE_DAYS", "14"))
 MIN_APP_SECONDS = float(os.environ.get("TAK0_LAYOUT_MIN_SECONDS", "60"))
 TICK = 5.0       # seconds between time-credit ticks
-FLUSH = 10.0     # seconds between writes of stats.json (only when changed)
+FLUSH = 30.0     # seconds between writes of stats.json (only when changed)
+MAX_APPS = int(os.environ.get("TAK0_LAYOUT_MAX_APPS", "150"))   # per-app tables kept
+STALE_DAYS = 7           # a small row is only dropped after this long untouched
+NOISE_SECONDS = 60.0     # per-app rows below this much lifetime use are dropped once stale
+KEEP_UNUSED_SECONDS = 600.0   # per-app rows of layouts no longer configured need this much to be kept
 PENDING_TTL = 1.0
 
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "tak0-layout"
@@ -50,14 +54,18 @@ class Stats:
         self.path = Path(path)
         self.half_life = half_life_days * 86400.0
         self.dirty = False
-        self.data = {"version": 1, "apps": {}, "global": {}, "keymaps": {}}
+        self.data = {"version": 1, "apps": {}, "global": {}, "keymaps": {}}  # keymaps: display name -> layout code
         self.load()
 
     def load(self):
         try:
             loaded = json.loads(self.path.read_text())
             if isinstance(loaded, dict) and loaded.get("version") == 1:
-                self.data.update(loaded)
+                for k in ("apps", "global", "keymaps"):
+                    if isinstance(loaded.get(k), dict):
+                        self.data[k] = loaded[k]
+                if any(isinstance(v, dict) for v in self.data["keymaps"].values()):
+                    self.data["keymaps"] = {}   # old per-config layout, relearned once
         except (OSError, ValueError):
             pass
 
@@ -105,40 +113,62 @@ class Stats:
         return None
 
     @staticmethod
-    def _percent(values):
+    def percent(values):
         total = sum(values.values())
         return {k: (round(100.0 * v / total, 1) if total else 0.0) for k, v in values.items()}
 
-    def snapshot(self, now):
-        """The data as written to disk: raw counters plus ready-made percentages."""
-        def view(bucket):
-            recent = self._percent({k: e["score"] * self._decay(now - e["ts"]) for k, e in bucket.items()})
-            total = self._percent({k: e["seconds"] for k, e in bucket.items()})
-            return {
-                k: {
-                    "seconds": round(e["seconds"], 1),
-                    "uses": e["uses"],
-                    "score": round(e["score"], 3),
-                    "ts": e["ts"],
-                    "percent_recent": recent[k],
-                    "percent_total": total[k],
-                }
-                for k, e in bucket.items()
-            }
-        return {
-            "version": 1,
-            "updated": int(now),
-            "half_life_days": self.half_life / 86400.0,
-            "global": view(self.data["global"]),
-            "apps": {a: view(b) for a, b in self.data["apps"].items()},
-            "keymaps": self.data["keymaps"],
-        }
+    def percents(self, bucket, now):
+        """(recent-weighted %, all-time %) for one bucket, computed on demand."""
+        recent = self.percent({k: e["score"] * self._decay(now - e["ts"]) for k, e in bucket.items()})
+        total = self.percent({k: e["seconds"] for k, e in bucket.items()})
+        return recent, total
 
-    def save(self, now=None):
+    def compact(self, now, active=None):
+        """Keep the file small however long it runs and however many layouts pile up.
+
+        * The global table is never pruned, so the history of every layout you ever
+          used survives, configured or not.
+        * Per-app rows are only a prediction aid: rows with almost no use are dropped once
+          they have gone stale (their time is still in the global table), rows of layouts that are no
+          longer configured need a bit more history to stay, and only the busiest
+          MAX_APPS apps keep a table.
+        * Numbers are rounded and the file is written without whitespace.
+        """
+        for app in list(self.data["apps"]):
+            bucket = self.data["apps"][app]
+            for layout in list(bucket):
+                e = bucket[layout]
+                floor = NOISE_SECONDS
+                if active and layout not in active:
+                    floor = KEEP_UNUSED_SECONDS
+                if e["seconds"] < floor and now - e["ts"] > STALE_DAYS * 86400:
+                    del bucket[layout]
+            if not bucket:
+                del self.data["apps"][app]
+        if len(self.data["apps"]) > MAX_APPS:
+            def weight(item):
+                return sum(e["score"] * self._decay(now - e["ts"]) for e in item[1].values())
+            keep = sorted(self.data["apps"].items(), key=weight, reverse=True)[:MAX_APPS]
+            self.data["apps"] = dict(keep)
+        for bucket in [self.data["global"], *self.data["apps"].values()]:
+            for e in bucket.values():
+                e["seconds"] = round(e["seconds"], 1)
+                e["score"] = round(e["score"], 1)
+                e["ts"] = int(e["ts"])
+
+    def snapshot(self, now):
+        g_recent, g_total = self.percents(self.data["global"], now)
+        out = dict(self.data, updated=int(now), half_life_days=self.half_life / 86400.0)
+        # live percentages of the global split sit at the top for easy reading
+        out["live_percent"] = {"recent": g_recent, "total": g_total}
+        return out
+
+    def save(self, now=None, active=None):
         now = now or time.time()
+        self.compact(now, active)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.snapshot(now), indent=1, sort_keys=True))
+        tmp.write_text(json.dumps(self.snapshot(now), separators=(",", ":"), sort_keys=True))
         os.replace(tmp, self.path)
         self.dirty = False
 
@@ -218,11 +248,9 @@ class Daemon:
             return
         if codes != self.layouts:
             self.layouts = codes
-        key = ",".join(codes)
-        known = self.stats.data["keymaps"].get(key)
-        if not known or any(c not in known.values() for c in codes):
-            known = self.calibrate(codes, active)
-            self.stats.data["keymaps"][key] = known
+        known = self.stats.data["keymaps"]
+        if not all(c in known.values() for c in codes):
+            known.update(self.calibrate(codes, active))
             self.stats.dirty = True
         self.names = dict(known)
         _, active = self.h.keyboard()
@@ -319,7 +347,7 @@ class Daemon:
     def maybe_flush(self, now=None, force=False):
         now = now or time.time()
         if force or (self.stats.dirty and now - self.last_flush >= FLUSH):
-            self.stats.save(now)
+            self.stats.save(now, set(self.layouts))
             self.last_flush = now
 
     # -- loop -------------------------------------------------------------
@@ -394,25 +422,27 @@ def fmt_time(sec):
 
 
 def cmd_stats(app):
-    try:
-        snap = json.loads(STATS_FILE.read_text())
-    except (OSError, ValueError):
+    stats = Stats()
+    if not stats.data["global"]:
         print("No statistics yet. Start the daemon: systemctl --user start tak0-layout")
         return 1
     sig = find_signature()
     active = set(Hypr(sig).keyboard()[0]) if sig else set()
-    buckets = [(f"app: {app}", snap["apps"].get(app, {}))] if app else [("all apps", snap["global"])]
-    if not app:
-        top = sorted(snap["apps"].items(), key=lambda kv: -sum(e["seconds"] for e in kv[1].values()))[:8]
-        buckets += [(f"app: {a}", b) for a, b in top]
+    now = time.time()
+    if app:
+        buckets = [(f"app: {app}", stats.data["apps"].get(app, {}))]
+    else:
+        top = sorted(stats.data["apps"].items(), key=lambda kv: -sum(e["seconds"] for e in kv[1].values()))[:8]
+        buckets = [("all apps", stats.data["global"])] + [(f"app: {a}", b) for a, b in top]
     for title, bucket in buckets:
         if not bucket:
             print(f"{title}: no data")
             continue
+        recent, total = stats.percents(bucket, now)
         print(f"\n{title}   (recent weighting | all time)")
-        for layout, e in sorted(bucket.items(), key=lambda kv: -kv[1]["percent_recent"]):
+        for layout, e in sorted(bucket.items(), key=lambda kv: -recent[kv[0]]):
             tag = "" if not active or layout in active else "  (not configured, data kept)"
-            print(f"  {layout:<8} {bar(e['percent_recent'])} {e['percent_recent']:5.1f}% | {e['percent_total']:5.1f}%"
+            print(f"  {layout:<8} {bar(recent[layout])} {recent[layout]:5.1f}% | {total[layout]:5.1f}%"
                   f"  {fmt_time(e['seconds']):>8}  {e['uses']} uses{tag}")
     return 0
 

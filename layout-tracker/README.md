@@ -55,8 +55,21 @@ systemctl --user status tak0-layout
 journalctl --user -u tak0-layout -f
 ```
 
-Statistics are written to `~/.local/share/tak0-layout/stats.json` about every 10 seconds while you work.
-Each layout has `percent_recent` (with decay) and `percent_total` (all time), plus seconds and uses.
+Statistics are written to `~/.local/share/tak0-layout/stats.json` every 30 seconds while something changes, as compact JSON,
+with the current split at the top under `live_percent`.
+
+### Storage stays small
+
+It keeps running totals, never a log, so it does not grow with time. It is also compacted on every write, so new layouts
+and apps do not pile up:
+
+- The **global** table keeps every layout you have ever used, configured or not. This is the permanent history.
+- **Per-app** rows are only a prediction aid. Rows with almost no use are dropped once they go stale (a week untouched),
+  rows of layouts you no longer have configured need more history to stay, and only the 150 busiest apps keep a table
+  (`TAK0_LAYOUT_MAX_APPS`).
+- Numbers are rounded and written without whitespace, and written atomically.
+
+A simulated year with 3000 different apps and 12 layouts picked up along the way came to about 16 KB.
 
 ## Notes
 
